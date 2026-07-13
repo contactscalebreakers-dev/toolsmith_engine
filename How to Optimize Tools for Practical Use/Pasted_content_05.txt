@@ -1,0 +1,1439 @@
+#!/usr/bin/env python3
+“””
+SB Toolsmith v2.3
+The GUI-first tool manager with robust threading and auto-dependency inference.
+“””
+from **future** import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple
+
+try:
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+GUI_AVAILABLE = True
+except ImportError:
+GUI_AVAILABLE = False
+
+HOME = Path.home()
+ROOT = Path(os.environ.get(“SB_TOOLSMITH_HOME”, HOME / “.sbtoolsmith”)).expanduser()
+TOOLS_DIR = ROOT / “tools”
+REGISTRY_PATH = ROOT / “registry.json”
+
+PIP_IMPORT_MAP = {
+“cv2”: “opencv-python”,
+“PIL”: “Pillow”,
+“skimage”: “scikit-image”,
+“yaml”: “PyYAML”,
+“bs4”: “beautifulsoup4”,
+“Crypto”: “pycryptodome”,
+“OpenSSL”: “pyOpenSSL”,
+“dotenv”: “python-dotenv”,
+“dateutil”: “python-dateutil”,
+“tqdm”: “tqdm”,
+“requests”: “requests”,
+“httpx”: “httpx”,
+“openai”: “openai”,
+“numpy”: “numpy”,
+“pandas”: “pandas”,
+“matplotlib”: “matplotlib”,
+“scipy”: “scipy”,
+“sklearn”: “scikit-learn”,
+“torch”: “torch”,
+“transformers”: “transformers”,
+“gradio”: “gradio”,
+“streamlit”: “streamlit”,
+“fastapi”: “fastapi”,
+“flask”: “Flask”,
+“django”: “Django”,
+}
+
+STDLIB_HINTS = {
+“argparse”, “asyncio”, “base64”, “collections”, “concurrent”, “contextlib”, “csv”,
+“dataclasses”, “datetime”, “email”, “functools”, “glob”, “hashlib”, “http”,
+“importlib”, “io”, “itertools”, “json”, “logging”, “math”, “multiprocessing”,
+“os”, “pathlib”, “pickle”, “platform”, “random”, “re”, “shlex”, “shutil”,
+“socket”, “sqlite3”, “statistics”, “subprocess”, “sys”, “tarfile”,
+“tempfile”, “textwrap”, “threading”, “time”, “types”, “typing”, “urllib”,
+“uuid”, “venv”, “xml”, “zipfile”, “zoneinfo”, “tomllib”, “typing_extensions”,
+}
+
+def _ensure_dirs() -> None:
+TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+ROOT.mkdir(parents=True, exist_ok=True)
+
+def _load_registry() -> dict:
+_ensure_dirs()
+if REGISTRY_PATH.exists():
+try:
+return json.loads(REGISTRY_PATH.read_text(encoding=“utf-8”))
+except Exception:
+return {“version”: 2, “tools”: {}, “preferences”: {“default_backend”: “pip”}}
+return {“version”: 2, “tools”: {}, “preferences”: {“default_backend”: “pip”}}
+
+def _save_registry(reg: dict) -> None:
+_ensure_dirs()
+REGISTRY_PATH.write_text(json.dumps(reg, indent=2), encoding=“utf-8”)
+
+def _sha1(s: str) -> str:
+return hashlib.sha1(s.encode(“utf-8”)).hexdigest()[:10]
+
+def _run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[dict] = None,
+timeout: Optional[int] = 300, cancel_event: Optional[threading.Event] = None) -> Tuple[int, str, bool]:
+“””
+Run command with optional timeout and cancellation.
+Returns: (returncode, output, was_cancelled)
+“””
+stdout = “”
+try:
+p = subprocess.Popen(
+cmd,
+cwd=str(cwd) if cwd else None,
+env=env,
+stdout=subprocess.PIPE,
+stderr=subprocess.STDOUT,
+text=True
+)
+
+```
+    if cancel_event:
+        while p.poll() is None:
+            if cancel_event.is_set():
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+                return -1, stdout, True
+
+            try:
+                # FIX 3: readline() instead of read(4096) — safer on Windows
+                line = p.stdout.readline()
+                if line:
+                    stdout += line
+            except Exception:
+                pass
+
+            time.sleep(0.1)
+
+        # Get remaining output
+        remaining, _ = p.communicate(timeout=1)
+        stdout += remaining
+    else:
+        stdout, _ = p.communicate(timeout=timeout)
+
+    return p.returncode, stdout, False
+
+except subprocess.TimeoutExpired:
+    p.kill()
+    return 124, stdout, False
+except Exception as e:
+    return 1, str(e), False
+```
+
+def _is_archive(p: Path) -> bool:
+return (p.suffix.lower() in {”.zip”, “.gz”, “.tgz”, “.bz2”, “.xz”} or
+p.name.endswith(”.tar.gz”) or p.name.endswith(”.tar”))
+
+def _unpack(src: Path, dest: Path) -> None:
+if dest.exists():
+shutil.rmtree(dest)
+dest.mkdir(parents=True, exist_ok=True)
+
+```
+if src.suffix.lower() == ".zip":
+    with zipfile.ZipFile(src, "r") as z:
+        z.extractall(dest)
+    return
+
+if src.name.endswith(".tar.gz") or src.suffix.lower() in {".tar", ".tgz", ".bz2", ".xz", ".gz"}:
+    with tarfile.open(src, "r:*") as t:
+        t.extractall(dest)
+    return
+
+raise ValueError(f"Unsupported archive: {src}")
+```
+
+def _find_project_root(extracted: Path) -> Path:
+entries = [p for p in extracted.iterdir() if not p.name.startswith(”__MACOSX”)]
+dirs = [p for p in entries if p.is_dir()]
+files = [p for p in entries if p.is_file()]
+if len(dirs) == 1 and not files:
+return dirs[0]
+return extracted
+
+def _detect_dep_files(root: Path) -> Dict[str, Path]:
+dep = {}
+for name in (“requirements.txt”, “pyproject.toml”, “setup.cfg”, “setup.py”,
+“poetry.lock”, “uv.lock”, “Pipfile”):
+p = root / name
+if p.exists():
+dep[name] = p
+return dep
+
+def _py_files(root: Path) -> List[Path]:
+return [p for p in root.rglob(”*.py”)
+if p.is_file() and “venv” not in p.parts and “.venv” not in p.parts]
+
+def _guess_entrypoint(root: Path) -> Optional[Path]:
+candidates = [“main.py”, “app.py”, “run.py”, “cli.py”, “**main**.py”]
+for c in candidates:
+p = root / c
+if p.exists():
+return p
+
+```
+for p in _py_files(root):
+    try:
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+        if re.search(r"if\s+__name__\s*==\s*[\"']__main__[\"']\s*:", txt):
+            return p
+    except Exception:
+        pass
+
+py_candidates = [p for p in _py_files(root) if p.name != "__init__.py"]
+if len(py_candidates) == 1:
+    return py_candidates[0]
+
+return None
+```
+
+def _imports_from_file(py: Path) -> List[str]:
+try:
+tree = ast.parse(py.read_text(encoding=“utf-8”, errors=“ignore”))
+except Exception:
+return []
+imps = []
+for node in ast.walk(tree):
+if isinstance(node, ast.Import):
+for n in node.names:
+imps.append(n.name.split(”.”)[0])
+elif isinstance(node, ast.ImportFrom):
+if node.module:
+imps.append(node.module.split(”.”)[0])
+return imps
+
+def _infer_requirements(root: Path) -> List[str]:
+imports = []
+for p in _py_files(root)[:80]:
+imports.extend(_imports_from_file(p))
+uniq = sorted(set(imports))
+
+```
+reqs = []
+for name in uniq:
+    if name in STDLIB_HINTS:
+        continue
+    pip_name = PIP_IMPORT_MAP.get(name)
+    if pip_name:
+        reqs.append(pip_name)
+    else:
+        reqs.append(name)
+
+out = []
+seen = set()
+for r in reqs:
+    if r.lower() not in seen:
+        out.append(r)
+        seen.add(r.lower())
+return out
+```
+
+def _looks_like_cli(entry_path: Path) -> bool:
+try:
+txt = entry_path.read_text(encoding=“utf-8”, errors=“ignore”)
+except Exception:
+return False
+return any(k in txt for k in (“argparse”, “click”, “typer”, “fire”))
+
+def _auto_heal_missing_paths(tool_root: Path, output: str) -> Tuple[bool, str]:
+m = re.search(r”FileNotFoundError: [Errno 2] No such file or directory: ‘([^’]+)’”, output)
+if not m:
+return False, “”
+
+```
+missing = m.group(1)
+missing_path = (tool_root / missing)
+
+try:
+    if missing_path.suffix:
+        missing_path.parent.mkdir(parents=True, exist_ok=True)
+        if not missing_path.exists():
+            missing_path.write_text("", encoding="utf-8")
+    else:
+        missing_path.mkdir(parents=True, exist_ok=True)
+    return True, f"Created missing path: {missing}"
+except Exception as e:
+    return False, str(e)
+```
+
+class BaseInstaller:
+def **init**(self, tool_root: Path, tool_dir: Path):
+self.tool_root = tool_root
+self.tool_dir = tool_dir
+self.venv_dir = tool_dir / “.venv”
+
+```
+def check_available(self) -> bool:
+    raise NotImplementedError
+
+def install(self, cancel_event: Optional[threading.Event] = None,
+            progress_queue: Optional[queue.Queue] = None) -> Tuple[bool, str]:
+    raise NotImplementedError
+
+def get_python(self) -> Optional[Path]:
+    raise NotImplementedError
+```
+
+class PipInstaller(BaseInstaller):
+def check_available(self) -> bool:
+return True
+
+```
+def install(self, cancel_event: Optional[threading.Event] = None,
+            progress_queue: Optional[queue.Queue] = None) -> Tuple[bool, str]:
+    import venv
+    if not self.venv_dir.exists():
+        if progress_queue:
+            progress_queue.put(("status", "Creating virtual environment..."))
+        venv.EnvBuilder(with_pip=True, clear=False).create(self.venv_dir)
+
+    py = self.get_python()
+    pip = self.venv_dir / ("Scripts/pip.exe" if os.name == "nt" else "bin/pip")
+
+    out_all = []
+
+    if progress_queue:
+        progress_queue.put(("status", "Upgrading pip..."))
+
+    rc, out, cancelled = _run([str(py), "-m", "pip", "install", "--upgrade",
+                               "pip", "setuptools", "wheel"],
+                              cancel_event=cancel_event)
+    out_all.append(out)
+    if cancelled:
+        return False, "\n".join(out_all)
+
+    dep_files = _detect_dep_files(self.tool_root)
+
+    if "requirements.txt" in dep_files:
+        if progress_queue:
+            progress_queue.put(("status", "Installing from requirements.txt..."))
+        rc, out, cancelled = _run([str(pip), "install", "-r",
+                                   str(dep_files["requirements.txt"])],
+                                  cwd=self.tool_root, cancel_event=cancel_event)
+        out_all.append(out)
+
+    elif "pyproject.toml" in dep_files:
+        if progress_queue:
+            progress_queue.put(("status", "Installing from pyproject.toml..."))
+        rc, out, cancelled = _run([str(py), "-m", "pip", "install", "-e", "."],
+                                  cwd=self.tool_root, cancel_event=cancel_event)
+        out_all.append(out)
+        if rc != 0 and not cancelled:
+            inferred = _infer_requirements(self.tool_root)
+            if inferred:
+                if progress_queue:
+                    progress_queue.put(("status", "Falling back to inferred deps..."))
+                rc, out, cancelled = _run([str(pip), "install"] + inferred,
+                                         cwd=self.tool_root, cancel_event=cancel_event)
+                out_all.append(out)
+
+    elif "setup.py" in dep_files or "setup.cfg" in dep_files:
+        if progress_queue:
+            progress_queue.put(("status", "Installing from setup.py..."))
+        rc, out, cancelled = _run([str(py), "-m", "pip", "install", "-e", "."],
+                                  cwd=self.tool_root, cancel_event=cancel_event)
+        out_all.append(out)
+        if rc != 0 and not cancelled:
+            inferred = _infer_requirements(self.tool_root)
+            if inferred:
+                rc, out, cancelled = _run([str(pip), "install"] + inferred,
+                                         cwd=self.tool_root, cancel_event=cancel_event)
+                out_all.append(out)
+    else:
+        inferred = _infer_requirements(self.tool_root)
+        if inferred:
+            if progress_queue:
+                progress_queue.put(("status", f"Inferred {len(inferred)} dependencies..."))
+            req_file = self.tool_root / "requirements.inferred.txt"
+            req_file.write_text("\n".join(inferred) + "\n", encoding="utf-8")
+            rc, out, cancelled = _run([str(pip), "install", "-r", str(req_file)],
+                                      cwd=self.tool_root, cancel_event=cancel_event)
+            out_all.append(out)
+
+    return rc == 0, "\n".join(out_all)
+
+def get_python(self) -> Optional[Path]:
+    py = self.venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    return py if py.exists() else None
+```
+
+class PoetryInstaller(BaseInstaller):
+def check_available(self) -> bool:
+rc, _, _ = _run([“poetry”, “–version”], timeout=10)
+return rc == 0
+
+```
+def install(self, cancel_event: Optional[threading.Event] = None,
+            progress_queue: Optional[queue.Queue] = None) -> Tuple[bool, str]:
+    out_all = []
+    has_lock = (self.tool_root / "poetry.lock").exists()
+
+    if has_lock:
+        if progress_queue:
+            progress_queue.put(("status", "Installing from poetry.lock..."))
+        rc, out, cancelled = _run(["poetry", "install", "--no-interaction"],
+                                  cwd=self.tool_root, cancel_event=cancel_event)
+        out_all.append("Using poetry.lock for reproducible install...")
+    else:
+        if (self.tool_root / "pyproject.toml").exists():
+            if progress_queue:
+                progress_queue.put(("status", "Installing from pyproject.toml..."))
+            rc, out, cancelled = _run(["poetry", "install", "--no-interaction"],
+                                      cwd=self.tool_root, cancel_event=cancel_event)
+            out_all.append("Installing from pyproject.toml...")
+        else:
+            if progress_queue:
+                progress_queue.put(("status", "Initializing poetry project..."))
+            rc, out, cancelled = _run(["poetry", "init", "--no-interaction", "--name", "tool"],
+                                      cwd=self.tool_root, cancel_event=cancel_event)
+            out_all.append(out)
+
+            if not cancelled:
+                inferred = _infer_requirements(self.tool_root)
+                for i, pkg in enumerate(inferred[:20]):
+                    if progress_queue:
+                        progress_queue.put(("status", f"Adding {pkg} ({i+1}/{min(20, len(inferred))})..."))
+                    rc, out, cancelled = _run(["poetry", "add", pkg],
+                                              cwd=self.tool_root, timeout=60,
+                                              cancel_event=cancel_event)
+                    out_all.append(out)
+                    if rc != 0 or cancelled:
+                        break
+
+    out_all.append(out)
+    return rc == 0, "\n".join(out_all)
+
+def get_python(self) -> Optional[Path]:
+    rc, out, _ = _run(["poetry", "env", "info", "--path"], cwd=self.tool_root)
+    if rc == 0:
+        env_path = Path(out.strip())
+        py = env_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        return py if py.exists() else None
+    return None
+```
+
+class UVInstaller(BaseInstaller):
+def check_available(self) -> bool:
+rc, _, _ = _run([“uv”, “–version”], timeout=10)
+return rc == 0
+
+```
+def install(self, cancel_event: Optional[threading.Event] = None,
+            progress_queue: Optional[queue.Queue] = None) -> Tuple[bool, str]:
+    out_all = []
+    venv_path = self.tool_dir / ".venv"
+
+    if progress_queue:
+        progress_queue.put(("status", "Creating UV virtual environment..."))
+
+    rc, out, cancelled = _run(["uv", "venv", str(venv_path)],
+                              cwd=self.tool_root, cancel_event=cancel_event)
+    out_all.append(out)
+
+    if rc != 0 or cancelled:
+        return False, "\n".join(out_all)
+
+    dep_files = _detect_dep_files(self.tool_root)
+    py = self.get_python()
+
+    if "requirements.txt" in dep_files:
+        if progress_queue:
+            progress_queue.put(("status", "Installing from requirements.txt..."))
+        rc, out, cancelled = _run([str(py), "-m", "pip", "install", "-r",
+                                   str(dep_files["requirements.txt"])],
+                                  cwd=self.tool_root, cancel_event=cancel_event)
+        out_all.append(out)
+
+    elif "pyproject.toml" in dep_files:
+        if progress_queue:
+            progress_queue.put(("status", "Installing from pyproject.toml..."))
+        rc, out, cancelled = _run([str(py), "-m", "pip", "install", "-e", "."],
+                                  cwd=self.tool_root, cancel_event=cancel_event)
+        out_all.append(out)
+        if rc != 0 and not cancelled:
+            inferred = _infer_requirements(self.tool_root)
+            if inferred:
+                rc, out, cancelled = _run([str(py), "-m", "pip", "install"] + inferred,
+                                         cwd=self.tool_root, cancel_event=cancel_event)
+                out_all.append(out)
+    else:
+        inferred = _infer_requirements(self.tool_root)
+        if inferred:
+            if progress_queue:
+                progress_queue.put(("status", f"Inferred {len(inferred)} dependencies..."))
+            rc, out, cancelled = _run([str(py), "-m", "pip", "install"] + inferred,
+                                      cwd=self.tool_root, cancel_event=cancel_event)
+            out_all.append(out)
+
+    return rc == 0, "\n".join(out_all)
+
+def get_python(self) -> Optional[Path]:
+    py = self.venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    return py if py.exists() else None
+```
+
+def get_installer(backend: str, tool_root: Path, tool_dir: Path) -> Optional[BaseInstaller]:
+backend_map = {
+“pip”: PipInstaller,
+“poetry”: PoetryInstaller,
+“uv”: UVInstaller,
+}
+
+```
+installer_class = backend_map.get(backend.lower())
+if not installer_class:
+    return None
+
+installer = installer_class(tool_root, tool_dir)
+if not installer.check_available():
+    return None
+
+return installer
+```
+
+def install_with_backend(key: str, backend: Optional[str] = None,
+cancel_event: Optional[threading.Event] = None,
+progress_queue: Optional[queue.Queue] = None) -> dict:
+reg = _load_registry()
+if key not in reg[“tools”]:
+raise SystemExit(f”Unknown tool key: {key}. Run ‘add’ first.”)
+
+```
+t = reg["tools"][key]
+tool_root = Path(t["root_dir"])
+tool_dir = Path(t["tool_dir"])
+
+if not backend:
+    backend = reg["preferences"].get("default_backend", "pip")
+    dep_files = _detect_dep_files(tool_root)
+    if "poetry.lock" in dep_files:
+        backend = "poetry"
+    elif "uv.lock" in dep_files:
+        backend = "uv"
+
+installer = get_installer(backend, tool_root, tool_dir)
+if not installer:
+    if progress_queue:
+        progress_queue.put(("status", f"{backend} not available, falling back to pip..."))
+    installer = PipInstaller(tool_root, tool_dir)
+    backend = "pip"
+
+success, output = installer.install(cancel_event=cancel_event,
+                                    progress_queue=progress_queue)
+
+result = {
+    "backend": backend,
+    "success": success,
+    "output_tail": output[-4000:],
+}
+
+t["last_install"] = result
+_save_registry(reg)
+return result
+```
+
+def run_with_backend(key: str, args: List[str], entry: Optional[str] = None,
+backend: Optional[str] = None,
+cancel_event: Optional[threading.Event] = None) -> dict:
+reg = _load_registry()
+if key not in reg[“tools”]:
+raise SystemExit(f”Unknown tool key: {key}. Run ‘add’ first.”)
+
+```
+t = reg["tools"][key]
+tool_root = Path(t["root_dir"])
+tool_dir = Path(t["tool_dir"])
+
+if not backend:
+    backend = t.get("last_install", {}).get("backend", "pip")
+
+installer = get_installer(backend, tool_root, tool_dir)
+if not installer:
+    installer = PipInstaller(tool_root, tool_dir)
+
+py = installer.get_python()
+if not py or not py.exists():
+    return {"returncode": 1, "output_tail": "Python not found. Run install first."}
+
+ep = None
+if entry:
+    ep_candidate = Path(entry).expanduser()
+    ep = (tool_root / ep_candidate).resolve() if not ep_candidate.is_absolute() else ep_candidate.resolve()
+else:
+    ep = (Path(t["entrypoint"]) if t.get("entrypoint") else None)
+
+if ep is None:
+    ep = _guess_entrypoint(tool_root)
+
+if ep is None:
+    return {"returncode": 2, "output_tail": "No entrypoint detected."}
+
+if args:
+    run_args = args
+else:
+    looks_cli = _looks_like_cli(ep)
+    run_args = ["--help"] if looks_cli else []
+
+rc, out, cancelled = _run([str(py), str(ep), *run_args],
+                          cwd=tool_root, cancel_event=cancel_event)
+
+if cancelled:
+    return {"returncode": -1, "output_tail": out, "cancelled": True}
+
+if rc != 0:
+    healed, heal_msg = _auto_heal_missing_paths(tool_root, out)
+    if healed:
+        rc2, out2, _ = _run([str(py), str(ep), *run_args], cwd=tool_root)
+        out = out + f"\n---auto-heal: {heal_msg}---\n" + out2
+        rc = rc2
+
+if rc != 0 and (not args) and run_args == ["--help"]:
+    rc2, out2, _ = _run([str(py), str(ep)], cwd=tool_root)
+    out = out + "\n---fallback run---\n" + out2
+    rc = rc2
+
+result = {"returncode": rc, "output_tail": out[-4000:]}
+t["last_smoke_test"] = result
+_save_registry(reg)
+return result
+```
+
+class ToolsmithGUI:
+def **init**(self):
+if not GUI_AVAILABLE:
+raise RuntimeError(“GUI not available. Install tkinter support.”)
+
+```
+    self.root = tk.Tk()
+    self.root.title("SB Toolsmith v2.3")
+    self.root.geometry("1000x750")
+    self.root.minsize(900, 600)
+
+    self.worker_thread: Optional[threading.Thread] = None
+    self.cancel_event: Optional[threading.Event] = None
+    self.progress_queue: queue.Queue = queue.Queue()
+    self.after_id: Optional[str] = None
+
+    # FIX 1: Initialise all_tools before build_ui to prevent AttributeError
+    self.all_tools = []
+
+    self.setup_styles()
+    self.build_ui()
+    self.check_queue()
+    self.refresh_tools_list()
+
+def setup_styles(self):
+    self.colors = {
+        "bg": "#f5f5f5",
+        "accent": "#2196F3",
+        "success": "#4CAF50",
+        "error": "#f44336",
+        "warning": "#FF9800",
+    }
+
+    style = ttk.Style()
+    style.theme_use('clam')
+
+def build_ui(self):
+    self.main_frame = ttk.Frame(self.root, padding="10")
+    self.main_frame.grid(row=0, column=0, sticky="nsew")
+
+    self.root.columnconfigure(0, weight=1)
+    self.root.rowconfigure(0, weight=1)
+    self.main_frame.columnconfigure(0, weight=1)
+    self.main_frame.rowconfigure(1, weight=1)
+
+    # Header
+    header = ttk.Frame(self.main_frame)
+    header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+    ttk.Label(header, text="🔧 SB Toolsmith", font=("Helvetica", 24, "bold")).pack(side="left")
+
+    backend_frame = ttk.LabelFrame(header, text="Backend", padding="5")
+    backend_frame.pack(side="right")
+
+    self.backend_var = tk.StringVar(value="auto")
+    self.backend_combo = ttk.Combobox(backend_frame, textvariable=self.backend_var,
+                                      values=["auto", "pip", "poetry", "uv"],
+                                      width=12, state="readonly")
+    self.backend_combo.pack()
+
+    # Main content
+    content = ttk.PanedWindow(self.main_frame, orient="horizontal")
+    content.grid(row=1, column=0, sticky="nsew")
+
+    # Left: Tool List
+    left_frame = ttk.LabelFrame(content, text="Tools", padding="5")
+    content.add(left_frame, weight=1)
+
+    self.search_var = tk.StringVar()
+    self.search_var.trace("w", lambda *args: self.filter_tools())
+    ttk.Entry(left_frame, textvariable=self.search_var).pack(fill="x", pady=(0, 5))
+
+    list_container = ttk.Frame(left_frame)
+    list_container.pack(fill="both", expand=True)
+
+    scrollbar = ttk.Scrollbar(list_container)
+    scrollbar.pack(side="right", fill="y")
+
+    self.tools_listbox = tk.Listbox(list_container, yscrollcommand=scrollbar.set,
+                                    font=("Consolas", 11), selectmode="single",
+                                    activestyle="none", exportselection=False)
+    self.tools_listbox.pack(side="left", fill="both", expand=True)
+    scrollbar.config(command=self.tools_listbox.yview)
+
+    self.tools_listbox.bind('<<ListboxSelect>>', self.on_tool_select)
+    self.tools_listbox.bind('<Double-1>', lambda e: self.run_tool_dialog())
+
+    self.count_label = ttk.Label(left_frame, text="0 tools")
+    self.count_label.pack(anchor="w", pady=(5, 0))
+
+    btn_frame = ttk.Frame(left_frame)
+    btn_frame.pack(fill="x", pady=(10, 0))
+
+    ttk.Button(btn_frame, text="➕ Add", command=self.add_tool_dialog).pack(fill="x", pady=2)
+    ttk.Button(btn_frame, text="🗑️ Remove", command=self.remove_tool).pack(fill="x", pady=2)
+    ttk.Button(btn_frame, text="📦 Export", command=self.pack_tool_dialog).pack(fill="x", pady=2)
+
+    # Right: Details & Output
+    right_frame = ttk.Frame(content)
+    content.add(right_frame, weight=2)
+
+    details_frame = ttk.LabelFrame(right_frame, text="Tool Details", padding="10")
+    details_frame.pack(fill="x", pady=(0, 10))
+
+    self.details_text = tk.Text(details_frame, height=6, wrap="word",
+                                font=("Consolas", 10), state="disabled",
+                                bg="#fafafa", relief="flat")
+    self.details_text.pack(fill="both", expand=True)
+
+    action_frame = ttk.Frame(right_frame)
+    action_frame.pack(fill="x", pady=(0, 10))
+
+    self.install_btn = ttk.Button(action_frame, text="📥 Install", command=self.install_tool)
+    self.install_btn.pack(side="left", padx=5)
+
+    self.run_btn = ttk.Button(action_frame, text="▶️ Run", command=self.run_tool_dialog)
+    self.run_btn.pack(side="left", padx=5)
+
+    ttk.Button(action_frame, text="🔍 Doctor", command=self.doctor_tool).pack(side="left", padx=5)
+
+    self.cancel_btn = ttk.Button(action_frame, text="⏹ Cancel", command=self.cancel_operation)
+    self.cancel_btn.pack(side="left", padx=5)
+    self.cancel_btn.pack_forget()
+
+    self.progress_frame = ttk.Frame(right_frame)
+    self.progress_frame.pack(fill="x", pady=(0, 5))
+    self.progress_frame.pack_forget()
+
+    self.progress_bar = ttk.Progressbar(self.progress_frame, mode='indeterminate')
+    self.progress_bar.pack(fill="x", side="left", expand=True)
+
+    self.status_var = tk.StringVar(value="Ready")
+    self.status_label = ttk.Label(right_frame, textvariable=self.status_var,
+                                  font=("Helvetica", 10, "italic"))
+    self.status_label.pack(anchor="w", pady=(0, 5))
+
+    output_frame = ttk.LabelFrame(right_frame, text="Output", padding="5")
+    output_frame.pack(fill="both", expand=True)
+
+    self.output_text = scrolledtext.ScrolledText(
+        output_frame,
+        wrap="word",
+        font=("Consolas", 10),
+        bg="#1e1e1e",
+        fg="#d4d4d4",
+        insertbackground="white",
+        relief="flat",
+        padx=10,
+        pady=10
+    )
+    self.output_text.pack(fill="both", expand=True)
+
+    self.output_menu = tk.Menu(self.output_text, tearoff=0)
+    self.output_menu.add_command(label="Copy", command=self.copy_output)
+    self.output_menu.add_command(label="Clear", command=self.clear_output)
+    self.output_text.bind("<Button-3>", self.show_output_menu)
+
+    self.status_bar = ttk.Label(self.main_frame, text="SB Toolsmith v2.3",
+                                relief="sunken", anchor="w")
+    self.status_bar.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+
+    self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+def check_queue(self):
+    try:
+        while True:
+            msg_type, data = self.progress_queue.get_nowait()
+
+            if msg_type == "status":
+                self.status_var.set(data)
+            elif msg_type == "log":
+                self.log(data.get("message", ""), tag=data.get("tag"))
+            elif msg_type == "complete":
+                self.operation_complete(data)
+            elif msg_type == "error":
+                self.operation_error(data)
+
+    except queue.Empty:
+        pass
+
+    self.after_id = self.root.after(100, self.check_queue)
+
+def start_operation(self, target, operation_name: str):
+    if self.worker_thread and self.worker_thread.is_alive():
+        messagebox.showwarning("Busy", "Another operation is in progress.")
+        return
+
+    self.cancel_event = threading.Event()
+
+    # Safe queue drain
+    try:
+        while True:
+            self.progress_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    self.set_ui_busy(True, operation_name)
+    self.progress_frame.pack(fill="x", pady=(0, 5))
+    self.progress_bar.start(15)
+
+    def wrapper():
+        try:
+            result = target(self.cancel_event, self.progress_queue)
+            if self.cancel_event.is_set():
+                self.progress_queue.put(("complete", {"cancelled": True, "result": result}))
+            else:
+                self.progress_queue.put(("complete", {"cancelled": False, "result": result}))
+        except Exception as e:
+            self.progress_queue.put(("error", str(e)))
+
+    self.worker_thread = threading.Thread(target=wrapper, daemon=True)
+    self.worker_thread.start()
+
+def cancel_operation(self):
+    if self.cancel_event and not self.cancel_event.is_set():
+        self.status_var.set("Cancelling...")
+        self.cancel_event.set()
+
+def operation_complete(self, data: dict):
+    self.progress_bar.stop()
+    self.progress_frame.pack_forget()
+    self.set_ui_busy(False)
+
+    if data.get("cancelled"):
+        self.log("\n--- Operation cancelled by user ---\n", tag="warning")
+        self.status_var.set("Cancelled")
+    else:
+        result = data.get("result", {})
+        if isinstance(result, dict):
+            if result.get("success"):
+                self.status_var.set("Completed successfully")
+            elif result.get("returncode") is not None:
+                self.status_var.set(f"Exit code: {result['returncode']}")
+            else:
+                self.status_var.set("Completed")
+    self.refresh_tools_list()
+
+def operation_error(self, error: str):
+    self.progress_bar.stop()
+    self.progress_frame.pack_forget()
+    self.set_ui_busy(False)
+    self.log(f"\n❌ ERROR: {error}\n", tag="error")
+    self.status_var.set("Error occurred")
+    messagebox.showerror("Error", str(error))
+
+def set_ui_busy(self, busy: bool, operation: str = ""):
+    state = "disabled" if busy else "normal"
+
+    self.install_btn.config(state=state)
+    self.run_btn.config(state=state)
+    self.backend_combo.config(state="disabled" if busy else "readonly")
+
+    if busy:
+        self.cancel_btn.pack(side="left", padx=5)
+        self.status_var.set(f"{operation}...")
+    else:
+        self.cancel_btn.pack_forget()
+
+def add_tool_dialog(self):
+    path = filedialog.askopenfilename(
+        title="Select Tool to Add",
+        filetypes=[
+            ("Python files", "*.py"),
+            ("Zip archives", "*.zip"),
+            ("Tar archives", "*.tar.gz *.tgz"),
+            ("All files", "*.*")
+        ]
+    )
+    if not path:
+        return
+
+    default_name = Path(path).stem
+    name = simpledialog.askstring("Tool Name",
+                                  f"Name for this tool (default: {default_name}):",
+                                  initialvalue=default_name)
+
+    if name is None:
+        return
+
+    try:
+        rec = register(path, name if name else None)
+        self.log(f"✓ Added: {rec.name} ({rec.key[:8]}...)", tag="success")
+        self.refresh_tools_list()
+
+        for i, tool in enumerate(list_tools()):
+            if tool["key"] == rec.key:
+                self.tools_listbox.selection_clear(0, "end")
+                self.tools_listbox.selection_set(i)
+                self.tools_listbox.see(i)
+                self.on_tool_select(None)
+                break
+
+    except Exception as e:
+        messagebox.showerror("Failed to Add", str(e))
+
+def remove_tool(self):
+    tool = self.get_selected_tool()
+    if not tool:
+        messagebox.showwarning("No Selection", "Please select a tool to remove.")
+        return
+
+    # FIX 2: tool_dir now available from list_tools()
+    reply = messagebox.askyesno(
+        "Confirm Removal",
+        f"Remove '{tool['name']}'?\n\nThis will delete:\n{tool.get('tool_dir', 'N/A')}",
+        icon="warning"
+    )
+    if not reply:
+        return
+
+    try:
+        reg = _load_registry()
+        if tool["key"] not in reg["tools"]:
+            raise ValueError("Tool not found in registry")
+
+        tool_record = reg["tools"][tool["key"]]
+        tool_dir = Path(tool_record["tool_dir"])
+
+        tool_dir_resolved = tool_dir.resolve()
+        tools_dir_resolved = TOOLS_DIR.resolve()
+
+        if not str(tool_dir_resolved).startswith(str(tools_dir_resolved)):
+            raise ValueError(f"Invalid tool directory: {tool_dir}")
+
+        if tool_dir.exists():
+            shutil.rmtree(tool_dir)
+
+        del reg["tools"][tool["key"]]
+        _save_registry(reg)
+
+        self.log(f"✓ Removed: {tool['name']}", tag="success")
+        self.refresh_tools_list()
+        self.clear_details()
+
+    except Exception as e:
+        messagebox.showerror("Removal Failed", str(e))
+
+def install_tool(self):
+    tool = self.get_selected_tool()
+    if not tool:
+        messagebox.showwarning("No Selection", "Please select a tool to install.")
+        return
+
+    backend = self.backend_var.get()
+    if backend == "auto":
+        backend = None
+
+    self.log(f"\n{'='*50}\n")
+    self.log(f"Installing: {tool['name']}")
+    self.log(f"Backend: {backend or 'auto-detect'}\n")
+
+    def do_install(cancel_event, progress_queue):
+        return install_with_backend(tool["key"], backend,
+                                    cancel_event=cancel_event,
+                                    progress_queue=progress_queue)
+
+    self.start_operation(do_install, "Installing")
+
+def run_tool_dialog(self):
+    tool = self.get_selected_tool()
+    if not tool:
+        messagebox.showwarning("No Selection", "Please select a tool to run.")
+        return
+
+    args_str = simpledialog.askstring("Arguments",
+                                      "Command line arguments (optional):",
+                                      parent=self.root)
+    if args_str is None:
+        return
+
+    args = args_str.split() if args_str.strip() else []
+    backend = self.backend_var.get()
+    if backend == "auto":
+        backend = None
+
+    self.log(f"\n{'='*50}\n")
+    self.log(f"Running: {tool['name']}")
+    if args:
+        self.log(f"Args: {args}\n")
+
+    def do_run(cancel_event, progress_queue):
+        return run_with_backend(tool["key"], args,
+                                backend=backend,
+                                cancel_event=cancel_event)
+
+    self.start_operation(do_run, "Running")
+
+def doctor_tool(self):
+    tool = self.get_selected_tool()
+    if not tool:
+        messagebox.showwarning("No Selection", "Please select a tool.")
+        return
+
+    try:
+        info = doctor(tool["key"])
+        self.log(f"\n{'='*50}\n")
+        self.log(f"DIAGNOSTIC: {tool['name']}\n")
+        self.log(f"{'='*50}\n")
+
+        self.log(f"Key: {info['tool']['key']}")
+        self.log(f"Source: {info['tool']['src']}")
+        self.log(f"Entrypoint: {info.get('entrypoint', 'N/A')}")
+        self.log(f"Backends available: {', '.join(k for k, v in info['backends_available'].items() if v)}")
+        self.log(f"Dependency files: {', '.join(info['dep_files'].keys()) or 'None'}")
+
+        if info.get('inferred_requirements'):
+            self.log(f"\nInferred dependencies ({len(info['inferred_requirements'])}):\n")
+            for req in info['inferred_requirements'][:10]:
+                self.log(f"  - {req}")
+            if len(info['inferred_requirements']) > 10:
+                self.log(f"  ... and {len(info['inferred_requirements']) - 10} more")
+
+        if info.get('last_install'):
+            li = info['last_install']
+            self.log(f"\nLast install: {li.get('backend', 'unknown')} - {'✓' if li.get('success') else '✗'}")
+
+    except Exception as e:
+        self.log(f"Error: {str(e)}", tag="error")
+
+def pack_tool_dialog(self):
+    tool = self.get_selected_tool()
+    if not tool:
+        messagebox.showwarning("No Selection", "Please select a tool to export.")
+        return
+
+    out_path = filedialog.asksaveasfilename(
+        defaultextension=".zip",
+        filetypes=[("ZIP archive", "*.zip")],
+        initialfile=f"{tool['name']}_v1.0.zip"
+    )
+
+    if not out_path:
+        return
+
+    try:
+        result = pack(tool["key"], out_path)
+        self.log(f"\n✓ Exported to: {result}", tag="success")
+        messagebox.showinfo("Export Complete", f"Tool exported to:\n{result}")
+    except Exception as e:
+        messagebox.showerror("Export Failed", str(e))
+
+def refresh_tools_list(self):
+    self.all_tools = list_tools()
+    self.filter_tools()
+
+def filter_tools(self):
+    search = self.search_var.get().lower()
+
+    self.tools_listbox.delete(0, "end")
+
+    for tool in self.all_tools:
+        name = tool["name"]
+        if search in name.lower():
+            status = "✓" if tool.get("last_install") else "○"
+            backend = tool.get("last_install", {}).get("backend", "") if tool.get("last_install") else ""
+            display = f"{status} {name}"
+            if backend:
+                display += f" ({backend})"
+            self.tools_listbox.insert("end", display)
+
+    self.count_label.config(text=f"{len(self.all_tools)} tools ({self.tools_listbox.size()} shown)")
+
+def get_selected_tool(self) -> Optional[dict]:
+    selection = self.tools_listbox.curselection()
+    if not selection:
+        return None
+
+    idx = selection[0]
+    search = self.search_var.get().lower()
+    visible = [t for t in self.all_tools if search in t["name"].lower()]
+
+    if idx < len(visible):
+        return visible[idx]
+    return None
+
+def on_tool_select(self, event):
+    tool = self.get_selected_tool()
+    if not tool:
+        self.clear_details()
+        return
+
+    self.details_text.config(state="normal")
+    self.details_text.delete(1.0, "end")
+
+    lines = [
+        f"Name: {tool['name']}",
+        f"Key: {tool['key'][:20]}...",
+        f"Source: {tool['src']}",
+        f"Entrypoint: {tool.get('entrypoint', 'Not detected')}",
+        "",
+    ]
+
+    if tool.get("last_install"):
+        li = tool["last_install"]
+        lines.append(f"Installed: {li.get('backend', 'unknown')} ({'✓ success' if li.get('success') else '✗ failed'})")
+
+    if tool.get("last_smoke_test"):
+        st = tool["last_smoke_test"]
+        status = "✓ pass" if st.get("returncode") == 0 else "✗ fail"
+        lines.append(f"Last run: {status}")
+
+    self.details_text.insert("end", "\n".join(lines))
+    self.details_text.config(state="disabled")
+
+def clear_details(self):
+    self.details_text.config(state="normal")
+    self.details_text.delete(1.0, "end")
+    self.details_text.config(state="disabled")
+
+def log(self, message: str, tag: Optional[str] = None):
+    self.output_text.config(state="normal")
+
+    if tag == "error":
+        self.output_text.insert("end", message + "\n", "error")
+        self.output_text.tag_config("error", foreground="#ff6b6b")
+    elif tag == "success":
+        self.output_text.insert("end", message + "\n", "success")
+        self.output_text.tag_config("success", foreground="#51cf66")
+    elif tag == "warning":
+        self.output_text.insert("end", message + "\n", "warning")
+        self.output_text.tag_config("warning", foreground="#ffd43b")
+    else:
+        self.output_text.insert("end", message + "\n")
+
+    self.output_text.see("end")
+    self.output_text.config(state="disabled")
+
+def clear_output(self):
+    self.output_text.config(state="normal")
+    self.output_text.delete(1.0, "end")
+    self.output_text.config(state="disabled")
+
+def copy_output(self):
+    try:
+        text = self.output_text.get(1.0, "end-1c")
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set("Copied to clipboard")
+    except Exception as e:
+        self.status_var.set(f"Copy failed: {e}")
+
+def show_output_menu(self, event):
+    self.output_menu.post(event.x_root, event.y_root)
+
+def on_closing(self):
+    if self.worker_thread and self.worker_thread.is_alive():
+        if messagebox.askyesno("Confirm Exit",
+                               "An operation is in progress. Cancel and exit?"):
+            self.cancel_operation()
+            self.root.after(500, self.root.destroy)
+        return
+
+    if self.after_id:
+        self.root.after_cancel(self.after_id)
+
+    self.root.destroy()
+
+def run(self):
+    self.root.mainloop()
+```
+
+def _tool_key(src: str) -> str:
+p = Path(src).expanduser().resolve()
+return f”{p.stem}-{_sha1(str(p))}”
+
+def *normalize_name(name: str) -> str:
+return re.sub(r”[^a-zA-Z0-9*-]+”, “-”, name).strip(”-”).lower()
+
+@dataclass
+class ToolRecord:
+key: str
+name: str
+src: str
+tool_dir: Path
+root_dir: Path
+entrypoint: Optional[str] = None
+
+def register(src: str, name: Optional[str] = None) -> ToolRecord:
+reg = _load_registry()
+p = Path(src).expanduser().resolve()
+if not p.exists():
+raise SystemExit(f”Path not found: {p}”)
+
+```
+key = _tool_key(str(p))
+safe_name = _normalize_name(name or p.stem)
+
+tool_dir = TOOLS_DIR / safe_name
+if tool_dir.exists() and reg["tools"].get(key) is None:
+    tool_dir = TOOLS_DIR / f"{safe_name}-{_sha1(key)}"
+
+src_unpack = tool_dir / "src"
+src_unpack.parent.mkdir(parents=True, exist_ok=True)
+forced_entry = None
+
+if p.is_dir():
+    if src_unpack.exists():
+        shutil.rmtree(src_unpack)
+    shutil.copytree(p, src_unpack)
+    root_dir = src_unpack
+else:
+    if _is_archive(p):
+        _unpack(p, src_unpack)
+        root_dir = _find_project_root(src_unpack)
+    elif p.suffix.lower() == ".py":
+        src_unpack.mkdir(parents=True, exist_ok=True)
+        dest = src_unpack / p.name
+        shutil.copy2(p, dest)
+        root_dir = src_unpack
+        forced_entry = dest
+    else:
+        raise SystemExit("Unsupported input. Use a folder, .py, .zip, or .tar.gz")
+
+entry = forced_entry or _guess_entrypoint(root_dir)
+rec = {
+    "key": key,
+    "name": safe_name,
+    "src": str(p),
+    "tool_dir": str(tool_dir),
+    "root_dir": str(root_dir),
+    "entrypoint": str(entry) if entry else None,
+    "last_install": None,
+    "last_smoke_test": None,
+}
+reg["tools"][key] = rec
+_save_registry(reg)
+return ToolRecord(key=key, name=safe_name, src=str(p), tool_dir=tool_dir,
+                  root_dir=root_dir, entrypoint=rec["entrypoint"])
+```
+
+def install(key: str) -> dict:
+return install_with_backend(key, “pip”)
+
+def run_tool(key: str, args: List[str], entry: Optional[str] = None) -> dict:
+return run_with_backend(key, args, entry)
+
+def doctor(key: str) -> dict:
+reg = _load_registry()
+if key not in reg[“tools”]:
+raise SystemExit(f”Unknown tool key: {key}. Run ‘add’ first.”)
+t = reg[“tools”][key]
+tool_root = Path(t[“root_dir”])
+tool_dir = Path(t[“tool_dir”])
+
+```
+backends = {}
+for name in ["pip", "poetry", "uv"]:
+    inst = get_installer(name, tool_root, tool_dir)
+    backends[name] = inst is not None
+
+dep = _detect_dep_files(tool_root)
+inferred = _infer_requirements(tool_root) if not dep else None
+
+return {
+    "tool": {"key": key, "name": t["name"], "src": t["src"]},
+    "paths": {"tool_root": str(tool_root), "venv_dir": str(tool_dir / ".venv")},
+    "dep_files": {k: str(v) for k, v in dep.items()},
+    "entrypoint": t.get("entrypoint"),
+    "inferred_requirements": inferred,
+    "backends_available": backends,
+    "last_install": t.get("last_install"),
+    "last_smoke_test": t.get("last_smoke_test"),
+}
+```
+
+def pack(key: str, out_zip: str) -> Path:
+reg = _load_registry()
+if key not in reg[“tools”]:
+raise SystemExit(f”Unknown tool key: {key}. Run ‘add’ first.”)
+t = reg[“tools”][key]
+tool_root = Path(t[“root_dir”])
+outp = Path(out_zip).expanduser().resolve()
+outp.parent.mkdir(parents=True, exist_ok=True)
+
+```
+manifest = {
+    "name": t["name"],
+    "src": t["src"],
+    "entrypoint": t.get("entrypoint"),
+    "dep_files": list(_detect_dep_files(tool_root).keys()),
+    "notes": "Packed by SB Toolsmith v2.3",
+}
+
+with zipfile.ZipFile(outp, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    z.writestr("sb_manifest.json", json.dumps(manifest, indent=2))
+    for p in tool_root.rglob("*"):
+        if p.is_dir():
+            continue
+        if "venv" in p.parts or ".venv" in p.parts or "__pycache__" in p.parts:
+            continue
+        rel = p.relative_to(tool_root)
+        z.write(p, arcname=str(Path("src") / rel))
+return outp
+```
+
+def list_tools() -> List[dict]:
+reg = _load_registry()
+tools = []
+for k, v in reg[“tools”].items():
+tools.append({
+“key”: k,
+“name”: v[“name”],
+“src”: v[“src”],
+“tool_dir”: v[“tool_dir”],  # FIX 2: include tool_dir for remove confirmation
+“entrypoint”: v.get(“entrypoint”),
+“last_install”: v.get(“last_install”),
+“last_smoke_test”: v.get(“last_smoke_test”),
+})
+return tools
+
+def set_default_backend(backend: str):
+reg = _load_registry()
+if backend not in [“pip”, “poetry”, “uv”]:
+raise ValueError(f”Unknown backend: {backend}”)
+reg[“preferences”][“default_backend”] = backend
+_save_registry(reg)
+print(f”Default backend set to: {backend}”)
+
+def main():
+parser = argparse.ArgumentParser(prog=“sb_toolsmith”,
+description=“Install & run Python tools in isolated venvs.”)
+parser.add_argument(”–version”, action=“version”, version=“SB Toolsmith v2.3”)
+
+```
+sub = parser.add_subparsers(dest="cmd", required=True)
+
+p_add = sub.add_parser("add", help="Register a tool from a path")
+p_add.add_argument("path", help="Path to tool")
+p_add.add_argument("--name", help="Optional short name")
+
+p_list = sub.add_parser("list", help="List registered tools")
+
+p_install = sub.add_parser("install", help="Install dependencies")
+p_install.add_argument("key", help="Tool key")
+p_install.add_argument("--backend", choices=["pip", "poetry", "uv"],
+                       help="Installer backend (default: auto-detect)")
+
+p_run = sub.add_parser("run", help="Run a tool")
+p_run.add_argument("key", help="Tool key")
+p_run.add_argument("--entry", help="Override entrypoint")
+p_run.add_argument("--backend", choices=["pip", "poetry", "uv"],
+                   help="Backend to use for running")
+p_run.add_argument("args", nargs=argparse.REMAINDER, help="Args passed to tool")
+
+p_doctor = sub.add_parser("doctor", help="Show diagnostic info")
+p_doctor.add_argument("key", help="Tool key")
+
+p_pack = sub.add_parser("pack", help="Create distributable zip")
+p_pack.add_argument("key", help="Tool key")
+p_pack.add_argument("--out", required=True, help="Output zip path")
+
+p_config = sub.add_parser("config", help="Configuration")
+p_config.add_argument("--default-backend", choices=["pip", "poetry", "uv"],
+                      help="Set default installer backend")
+
+p_gui = sub.add_parser("gui", help="Launch GUI mode")
+
+args = parser.parse_args()
+
+if args.cmd == "add":
+    rec = register(args.path, args.name)
+    print(json.dumps({
+        "added": True,
+        "key": rec.key,
+        "name": rec.name,
+        "root_dir": str(rec.root_dir),
+        "entrypoint": rec.entrypoint,
+    }, indent=2))
+    return
+
+if args.cmd == "list":
+    print(json.dumps(list_tools(), indent=2))
+    return
+
+if args.cmd == "install":
+    res = install_with_backend(args.key, args.backend)
+    print(json.dumps(res, indent=2))
+    return
+
+if args.cmd == "run":
+    run_args = args.args
+    if run_args and run_args[0] == "--":
+        run_args = run_args[1:]
+    res = run_with_backend(args.key, run_args, entry=args.entry, backend=args.backend)
+    print(json.dumps(res, indent=2))
+    return
+
+if args.cmd == "doctor":
+    print(json.dumps(doctor(args.key), indent=2, default=str))
+    return
+
+if args.cmd == "pack":
+    outp = pack(args.key, args.out)
+    print(json.dumps({"packed": True, "out": str(outp)}, indent=2))
+    return
+
+if args.cmd == "config":
+    if args.default_backend:
+        set_default_backend(args.default_backend)
+    return
+
+if args.cmd == "gui":
+    if not GUI_AVAILABLE:
+        print("Error: GUI not available. Install tkinter support.")
+        sys.exit(1)
+    app = ToolsmithGUI()
+    app.run()
+    return
+```
+
+if **name** == “**main**”:
+main()

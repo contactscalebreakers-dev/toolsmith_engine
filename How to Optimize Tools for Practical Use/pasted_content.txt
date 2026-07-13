@@ -1,0 +1,201 @@
+You are a senior autonomous systems architect and desktop software engineer.
+
+Your task is to evolve the existing “SB Toolsmith Pro” Python/Tkinter application into a production-grade Windows 11 desktop platform for autonomous tool management, isolated execution, AI-assisted debugging, and agentic workflow orchestration.
+
+IMPORTANT:
+Do NOT generate fragmented snippets.
+Generate ONE complete production-ready build architecture.
+All code must integrate into one coherent system.
+
+==================================================
+PROJECT GOAL
+==================================================
+
+SB Toolsmith Pro is evolving from:
+“Python tool installer GUI”
+into:
+“Agentic desktop runtime and autonomous DevOps orchestration platform.”
+
+The system must:
+- import tools/projects
+- isolate dependencies
+- infer requirements
+- install environments
+- run applications
+- self-heal runtime issues
+- support AI agents
+- support plugins
+- support workflow graphs
+- package/export projects
+- eventually become a local autonomous software operating layer
+
+==================================================
+CURRENT FOUNDATION
+==================================================
+
+The current architecture already includes:
+- PipInstaller
+- PoetryInstaller
+- UVInstaller
+- dependency inference via AST
+- GUI threading
+- queue-based UI updates
+- cancellation support
+- auto-healing for missing paths
+- registry system
+- packaging/export system
+- virtual environment isolation
+
+Preserve and improve this architecture.
+
+==================================================
+PRIMARY OBJECTIVES
+==================================================
+
+1. Replace Tkinter with PySide6 (Qt6)
+2. Create modern Windows 11 UI
+3. Add dockable panels
+4. Add embedded terminal console
+5. Add event bus architecture
+6. Add plugin SDK
+7. Add execution graph runtime
+8. Add agent orchestration layer
+9. Add structured logging system
+10. Add workspace/session persistence
+11. Add dependency graph visualization
+12. Add autonomous repair pipeline
+13. Add tool health monitoring
+14. Add AI integration interfaces
+15. Add async task scheduler
+16. Add package builder/export system
+17. Add runtime snapshots and rollback
+
+==================================================
+ARCHITECTURE REQUIREMENTS
+==================================================
+
+Generate a complete modular architecture:
+
+/core
+/gui
+/agents
+/plugins
+/runtime
+/events
+/installers
+/packaging
+/diagnostics
+/logging
+/ai
+/utils
+
+==================================================
+AGENT SYSTEM REQUIREMENTS
+==================================================
+
+Create:
+- PlannerAgent
+- InstallerAgent
+- RepairAgent
+- DependencyAgent
+- ExecutionAgent
+- PackagingAgent
+
+Agents must:
+- communicate through event bus
+- operate asynchronously
+- maintain task state
+- support retries
+- emit structured logs
+
+==================================================
+PLUGIN SDK
+==================================================
+
+Design plugin API:
+- plugin manifest
+- lifecycle hooks
+- event subscriptions
+- UI injection
+- command registration
+
+==================================================
+EXECUTION GRAPH
+==================================================
+
+Implement DAG execution engine.
+
+Nodes:
+- install
+- analyze
+- infer
+- repair
+- test
+- package
+- deploy
+
+Support:
+- retries
+- rollback
+- branching
+- cancellation
+
+==================================================
+AI INTEGRATION
+==================================================
+
+Prepare interfaces for:
+- local LLMs
+- Ollama
+- OpenAI-compatible APIs
+- code analysis agents
+- dependency repair agents
+
+DO NOT hardcode cloud dependency.
+
+==================================================
+UI REQUIREMENTS
+==================================================
+
+Modern dark-mode Windows 11 aesthetic:
+- sidebar navigation
+- live logs
+- task progress
+- embedded terminal
+- node graph viewer
+- plugin browser
+- diagnostics panel
+- agent monitor
+
+==================================================
+OUTPUT FORMAT
+==================================================
+
+Return:
+1. Full architecture map
+2. Folder structure
+3. Complete implementation plan
+4. Dependency list
+5. Production-ready source files
+6. Build pipeline
+7. Packaging instructions
+8. Windows .exe deployment strategy
+9. Future scaling roadmap
+
+==================================================
+IMPORTANT RULES
+==================================================
+
+- No pseudo-code
+- No placeholders
+- No fragmented snippets
+- Build coherent production architecture
+- Use strong typing
+- Use async patterns where appropriate
+- Follow enterprise-grade engineering practices
+- Optimize for maintainability and extensibility
+- Prefer modular systems over monoliths
+
+Target:
+Windows 11 desktop application (.exe distributable)
+with future Linux support.
